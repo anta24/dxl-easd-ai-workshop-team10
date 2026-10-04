@@ -51,7 +51,35 @@ def review_contract(spec: dict, ai) -> list[dict]:
          "/paths/~1orders/get" is spec["paths"]["/orders"]["get"].
          It is not "//orders" -- the slash belongs to the key name "/orders".
     """
-    return ai.ask("contract_review", spec)
+    findings = ai.ask("contract_review", spec)
+    verified = []
+
+    for finding in findings:
+        path = finding.get("path")
+        method = finding.get("method")
+
+        # Verify that the path and HTTP method exist in the spec.
+        if path not in spec.get("paths", {}):
+            continue
+        if method not in spec["paths"][path]:
+            continue
+
+        # Verify that the JSON evidence pointer resolves inside the spec.
+        pointer = finding.get("evidence_pointer", "")
+        try:
+            current = spec
+            for part in pointer.split("/")[1:]:
+                key = part.replace("~1", "/").replace("~0", "~")
+                if isinstance(current, list):
+                    current = current[int(key)]
+                else:
+                    current = current[key]
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+
+        verified.append(finding)
+
+    return verified
 
 
 def design_negative_tests(spec: dict, ai) -> list[dict]:
@@ -86,7 +114,33 @@ def design_negative_tests(spec: dict, ai) -> list[dict]:
       3. The case has all required fields: name, method, path, input,
          expected_status.
     """
-    return ai.ask("negative_tests", spec)
+    cases = ai.ask("negative_tests", spec)
+    verified = []
+
+    required_fields = {"name", "method", "path", "input", "expected_status"}
+    valid_statuses = {400, 401, 403, 404, 409, 422}
+
+    for case in cases:
+        # All required fields must be present.
+        if not required_fields.issubset(case):
+            continue
+
+        path = case["path"]
+        method = case["method"].lower()
+
+        # The endpoint and HTTP method must exist in the OpenAPI spec.
+        if path not in spec.get("paths", {}):
+            continue
+        if method not in spec["paths"][path]:
+            continue
+
+        # A negative test must expect an allowed client-error status.
+        if case["expected_status"] not in valid_statuses:
+            continue
+
+        verified.append(case)
+
+    return verified    
 
 
 def diagnose_incident(logs: str, ai) -> dict:
@@ -112,7 +166,15 @@ def diagnose_incident(logs: str, ai) -> dict:
     appears literally somewhere inside the logs string.
     The log file is at  data/incident.log  -- open it to see what is there.
     """
-    return ai.ask("incident_diagnosis", logs)[0]   # [0] is unverified; fix it
+    candidates = ai.ask("incident_diagnosis", logs)
+
+    for candidate in candidates:
+        evidence = candidate.get("evidence", [])
+
+        if evidence and all(item in logs for item in evidence):
+            return candidate
+
+    return {}    
 
 
 def review_migration(v1: dict, v2: dict, ai) -> list[dict]:
@@ -155,4 +217,56 @@ def review_migration(v1: dict, v2: dict, ai) -> list[dict]:
       "schema_changed"          -- parameter["schema"] differs between v1 and v2.
                                    If the schemas are identical the claim is false.
     """
-    return ai.ask("migration_review", {"v1": v1, "v2": v2})
+    findings = ai.ask("migration_review", {"v1": v1, "v2": v2})
+    verified = []
+
+    def get_operation(spec, path, method):
+        return spec.get("paths", {}).get(path, {}).get(method.lower())
+
+    def get_parameter(operation, name):
+        if not operation:
+            return None
+        for parameter in operation.get("parameters", []):
+            if parameter.get("name") == name:
+                return parameter
+        return None
+
+    for finding in findings:
+        path = finding.get("path")
+        method = finding.get("method", "").lower()
+        kind = finding.get("kind")
+
+        op_v1 = get_operation(v1, path, method)
+        op_v2 = get_operation(v2, path, method)
+
+        if kind == "operation_removed":
+            # Valid only if the operation existed in v1 and is absent in v2.
+            if op_v1 is not None and op_v2 is None:
+                verified.append(finding)
+
+        elif kind == "parameter_became_required":
+            parameter_name = finding.get("parameter")
+            param_v1 = get_parameter(op_v1, parameter_name)
+            param_v2 = get_parameter(op_v2, parameter_name)
+
+            if (
+                param_v1 is not None
+                and param_v2 is not None
+                and not param_v1.get("required", False)
+                and param_v2.get("required", False)
+            ):
+                verified.append(finding)
+
+        elif kind == "schema_changed":
+            parameter_name = finding.get("parameter")
+            param_v1 = get_parameter(op_v1, parameter_name)
+            param_v2 = get_parameter(op_v2, parameter_name)
+
+            if (
+                param_v1 is not None
+                and param_v2 is not None
+                and param_v1.get("schema") != param_v2.get("schema")
+            ):
+                verified.append(finding)
+
+    return verified    
